@@ -29,7 +29,7 @@ message TranscriptionAudio {
     // Inline audio bytes.
     bytes content = 1 [(google.api.field_behavior) = INPUT_ONLY];
 
-    // URI for audio content. Reserved for future use.
+    // Resource name of an existing audio attachment: "attachments/{uid}".
     string uri = 2;
   }
 

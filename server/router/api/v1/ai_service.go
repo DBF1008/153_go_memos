@@ -18,6 +18,7 @@ import (
 	sttopenai "github.com/usememos/memos/internal/ai/stt/openai"
 	v1pb "github.com/usememos/memos/proto/gen/api/v1"
 	storepb "github.com/usememos/memos/proto/gen/store"
+	"github.com/usememos/memos/store"
 )
 
 const (
@@ -45,6 +46,7 @@ var supportedTranscriptionContentTypes = map[string]bool{
 }
 
 // Transcribe transcribes an audio file using an instance AI provider.
+// Audio can be supplied as inline bytes or by referencing an existing attachment URI.
 func (s *APIV1Service) Transcribe(ctx context.Context, request *v1pb.TranscribeRequest) (*v1pb.TranscribeResponse, error) {
 	user, err := s.fetchCurrentUser(ctx)
 	if err != nil {
@@ -57,26 +59,23 @@ func (s *APIV1Service) Transcribe(ctx context.Context, request *v1pb.TranscribeR
 	if request.Audio == nil {
 		return nil, status.Errorf(codes.InvalidArgument, "audio is required")
 	}
-	if request.Audio.GetUri() != "" {
-		return nil, status.Errorf(codes.InvalidArgument, "audio uri is not supported")
-	}
-	content := request.Audio.GetContent()
-	if len(content) == 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "audio content is required")
-	}
-	if len(content) > maxTranscriptionAudioSizeBytes {
-		return nil, status.Errorf(codes.InvalidArgument, "audio file is too large; maximum size is 25 MiB")
-	}
-	filename := strings.TrimSpace(request.Audio.GetFilename())
-	if len(filename) > maxTranscriptionFilenameLength {
-		return nil, status.Errorf(codes.InvalidArgument, "filename is too long; maximum length is %d characters", maxTranscriptionFilenameLength)
-	}
-	contentType := strings.TrimSpace(request.Audio.GetContentType())
-	if contentType == "" {
-		contentType = http.DetectContentType(content)
-	}
-	if !isSupportedTranscriptionContentType(contentType) {
-		return nil, status.Errorf(codes.InvalidArgument, "audio content type %q is not supported", contentType)
+
+	var content []byte
+	var filename, contentType string
+
+	switch {
+	case request.Audio.GetUri() != "":
+		content, filename, contentType, err = s.resolveTranscriptionAttachment(ctx, request.Audio)
+		if err != nil {
+			return nil, err
+		}
+	case len(request.Audio.GetContent()) > 0:
+		content, filename, contentType, err = s.validateInlineTranscriptionAudio(request.Audio)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "audio content or URI is required")
 	}
 
 	aiSetting, err := s.Store.GetInstanceAISetting(ctx)
@@ -118,6 +117,73 @@ func (s *APIV1Service) Transcribe(ctx context.Context, request *v1pb.TranscribeR
 		return nil, status.Errorf(codes.Internal, "failed to transcribe audio: %v", err)
 	}
 	return &v1pb.TranscribeResponse{Text: text}, nil
+}
+
+// resolveTranscriptionAttachment looks up an existing attachment by URI, checks
+// permissions, validates file type and size, and returns the audio blob together
+// with the filename and content type to use for transcription.
+func (s *APIV1Service) resolveTranscriptionAttachment(ctx context.Context, audio *v1pb.TranscriptionAudio) ([]byte, string, string, error) {
+	attachmentUID, err := ExtractAttachmentUIDFromName(audio.GetUri())
+	if err != nil {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "invalid attachment URI: %v", err)
+	}
+
+	attachment, err := s.Store.GetAttachment(ctx, &store.FindAttachment{UID: &attachmentUID, GetBlob: true})
+	if err != nil {
+		return nil, "", "", status.Errorf(codes.Internal, "failed to get attachment: %v", err)
+	}
+	if attachment == nil {
+		return nil, "", "", status.Errorf(codes.NotFound, "attachment not found: %s", audio.GetUri())
+	}
+
+	if err := s.checkAttachmentAccess(ctx, attachment); err != nil {
+		return nil, "", "", err
+	}
+
+	if !isSupportedTranscriptionContentType(attachment.Type) {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "audio content type %q is not supported", attachment.Type)
+	}
+	if attachment.Size > maxTranscriptionAudioSizeBytes {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "audio file is too large; maximum size is 25 MiB")
+	}
+
+	blob, err := s.GetAttachmentBlob(attachment)
+	if err != nil {
+		return nil, "", "", status.Errorf(codes.Internal, "failed to read attachment blob: %v", err)
+	}
+
+	filename := strings.TrimSpace(audio.GetFilename())
+	if filename == "" {
+		filename = attachment.Filename
+	} else if len(filename) > maxTranscriptionFilenameLength {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "filename is too long; maximum length is %d characters", maxTranscriptionFilenameLength)
+	}
+
+	return blob, filename, attachment.Type, nil
+}
+
+// validateInlineTranscriptionAudio validates inline audio bytes and returns the
+// content, filename, and content type ready for provider dispatch.
+func (*APIV1Service) validateInlineTranscriptionAudio(audio *v1pb.TranscriptionAudio) ([]byte, string, string, error) {
+	content := audio.GetContent()
+	if len(content) > maxTranscriptionAudioSizeBytes {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "audio file is too large; maximum size is 25 MiB")
+	}
+
+	filename := strings.TrimSpace(audio.GetFilename())
+	if len(filename) > maxTranscriptionFilenameLength {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "filename is too long; maximum length is %d characters", maxTranscriptionFilenameLength)
+	}
+
+	contentType := strings.TrimSpace(audio.GetContentType())
+	if contentType == "" {
+		contentType = http.DetectContentType(content)
+	}
+	if !isSupportedTranscriptionContentType(contentType) {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "audio content type %q is not supported", contentType)
+	}
+
+	return content, filename, contentType, nil
 }
 
 func (*APIV1Service) transcribeViaSTT(
