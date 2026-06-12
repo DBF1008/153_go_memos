@@ -256,6 +256,61 @@ func TestUserListWithLimit(t *testing.T) {
 	ts.Close()
 }
 
+func TestUserListWithLimitAndOffset(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := NewTestingStore(ctx, t)
+
+	// Create 5 users.
+	for i := 0; i < 5; i++ {
+		_, err := createTestingUserWithRole(ctx, ts, fmt.Sprintf("offuser%d", i), store.RoleUser)
+		require.NoError(t, err)
+	}
+
+	// List all to get the canonical ordering.
+	allUsers, err := ts.ListUsers(ctx, &store.FindUser{})
+	require.NoError(t, err)
+	require.Equal(t, 5, len(allUsers))
+
+	// Limit=2, Offset=0 → first 2 users.
+	limit := 2
+	offset := 0
+	page1, err := ts.ListUsers(ctx, &store.FindUser{Limit: &limit, Offset: &offset})
+	require.NoError(t, err)
+	require.Equal(t, 2, len(page1))
+	require.Equal(t, allUsers[0].ID, page1[0].ID)
+	require.Equal(t, allUsers[1].ID, page1[1].ID)
+
+	// Limit=2, Offset=2 → next 2 users.
+	offset = 2
+	page2, err := ts.ListUsers(ctx, &store.FindUser{Limit: &limit, Offset: &offset})
+	require.NoError(t, err)
+	require.Equal(t, 2, len(page2))
+	require.Equal(t, allUsers[2].ID, page2[0].ID)
+	require.Equal(t, allUsers[3].ID, page2[1].ID)
+
+	// Limit=2, Offset=4 → last 1 user.
+	offset = 4
+	page3, err := ts.ListUsers(ctx, &store.FindUser{Limit: &limit, Offset: &offset})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(page3))
+	require.Equal(t, allUsers[4].ID, page3[0].ID)
+
+	// Limit=2, Offset=10 → empty.
+	offset = 10
+	page4, err := ts.ListUsers(ctx, &store.FindUser{Limit: &limit, Offset: &offset})
+	require.NoError(t, err)
+	require.Equal(t, 0, len(page4))
+
+	// Offset without limit returns all from offset.
+	offset = 3
+	noLimitOffset, err := ts.ListUsers(ctx, &store.FindUser{Offset: &offset})
+	require.NoError(t, err)
+	require.Equal(t, 2, len(noLimitOffset))
+
+	ts.Close()
+}
+
 func createTestingHostUser(ctx context.Context, ts *store.Store) (*store.User, error) {
 	return createTestingUserWithRole(ctx, ts, "test", store.RoleAdmin)
 }

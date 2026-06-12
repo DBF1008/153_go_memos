@@ -74,6 +74,13 @@ func (s *APIV1Service) ListUsers(ctx context.Context, request *v1pb.ListUsersReq
 
 	userFind := &store.FindUser{}
 
+	// show_deleted controls whether archived users are included.
+	// By default (show_deleted=false), only NORMAL users are returned.
+	if !request.GetShowDeleted() {
+		normal := store.Normal
+		userFind.RowStatus = &normal
+	}
+
 	if request.Filter != "" {
 		username, err := extractUsernameFromFilter(request.Filter)
 		if err != nil {
@@ -84,16 +91,53 @@ func (s *APIV1Service) ListUsers(ctx context.Context, request *v1pb.ListUsersReq
 		}
 	}
 
+	// Compute total_size: count all users matching the filter (without pagination).
+	allUsers, err := s.Store.ListUsers(ctx, userFind)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to list users: %v", err)
+	}
+	totalSize := int32(len(allUsers))
+
+	// Parse pagination parameters.
+	var limit, offset int
+	if request.PageToken != "" {
+		var pageToken v1pb.PageToken
+		if err := unmarshalPageToken(request.PageToken, &pageToken); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid page token: %v", err)
+		}
+		limit = normalizePageSize(pageToken.Limit)
+		offset = int(pageToken.Offset)
+		if offset < 0 {
+			offset = 0
+		}
+	} else {
+		limit = normalizePageSize(request.PageSize)
+	}
+	limit = min(limit, MaxPageSize)
+
+	// Fetch limit+1 to determine if there is a next page.
+	limitPlusOne := limit + 1
+	userFind.Limit = &limitPlusOne
+	userFind.Offset = &offset
+
 	users, err := s.Store.ListUsers(ctx, userFind)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list users: %v", err)
 	}
 
-	// TODO: Implement proper ordering, and pagination
-	// For now, return all users with basic structure
+	nextPageToken := ""
+	if len(users) == limitPlusOne {
+		users = users[:limit]
+		nextPageToken, err = getPageToken(limit, offset+limit)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to get next page token, error: %v", err)
+		}
+	}
+
 	response := &v1pb.ListUsersResponse{
-		Users:     []*v1pb.User{},
-		TotalSize: int32(len(users)),
+		Users:         []*v1pb.User{},
+		NextPageToken: nextPageToken,
+		TotalSize:     totalSize,
 	}
 	for _, user := range users {
 		response.Users = append(response.Users, convertUserFromStore(user, currentUser))
