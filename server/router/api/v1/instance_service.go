@@ -12,7 +12,10 @@ import (
 	colorpb "google.golang.org/genproto/googleapis/type/color"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	v1pb "github.com/usememos/memos/proto/gen/api/v1"
 	storepb "github.com/usememos/memos/proto/gen/store"
@@ -178,14 +181,17 @@ func (s *APIV1Service) UpdateInstanceSetting(ctx context.Context, request *v1pb.
 		return nil, status.Errorf(codes.PermissionDenied, "permission denied")
 	}
 
-	// TODO: Apply update_mask if specified
-	_ = request.UpdateMask
-
 	if err := validateInstanceSetting(request.Setting); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid instance setting: %v", err)
 	}
 
-	updateSetting := convertInstanceSettingToStore(request.Setting)
+	// Honor update_mask: when it lists fields, only those fields are written and every
+	// other field (including stored write-only secrets) keeps its current value. An empty
+	// mask means full replacement, preserving the historical behavior of this endpoint.
+	updateSetting, err := s.mergeInstanceSettingWithMask(ctx, convertInstanceSettingToStore(request.Setting), request.UpdateMask)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "failed to apply update mask: %v", err)
+	}
 
 	// Preserve write-only credential fields when the caller sends an empty value.
 	// An empty string means "no change", not "clear the credential".
@@ -221,6 +227,168 @@ func (s *APIV1Service) UpdateInstanceSetting(ctx context.Context, request *v1pb.
 	}
 
 	return convertInstanceSettingFromStore(instanceSetting), nil
+}
+
+// mergeInstanceSettingWithMask applies request.update_mask to the incoming setting.
+//
+// With an empty mask the incoming value is returned unchanged (full replacement). With a
+// non-empty mask the result starts from the currently stored value and only the masked
+// fields are overlaid from the incoming value, so unspecified fields — including stored
+// write-only secrets that the client never receives — keep their existing values.
+func (s *APIV1Service) mergeInstanceSettingWithMask(ctx context.Context, incoming *storepb.InstanceSetting, mask *fieldmaskpb.FieldMask) (*storepb.InstanceSetting, error) {
+	if mask == nil || len(mask.GetPaths()) == 0 {
+		return incoming, nil
+	}
+
+	wrapperField := instanceSettingValueFieldName(incoming.Key)
+	fields := map[string]bool{}
+	for _, path := range mask.GetPaths() {
+		field := normalizeInstanceSettingMaskPath(path, wrapperField)
+		if field == "" {
+			// The path addresses the whole value message (e.g. "storage_setting"),
+			// which is equivalent to replacing it outright.
+			return incoming, nil
+		}
+		fields[field] = true
+	}
+
+	incomingValue := instanceSettingValueMessage(incoming)
+	if incomingValue == nil {
+		return nil, errors.New("setting value is required when update_mask is set")
+	}
+	existingValue, err := s.existingInstanceSettingValue(ctx, incoming.Key)
+	if err != nil {
+		return nil, err
+	}
+	if existingValue == nil {
+		existingValue = incomingValue.ProtoReflect().New().Interface()
+	}
+
+	mergedValue := applyInstanceSettingFieldMask(existingValue, incomingValue, fields)
+	return wrapInstanceSettingValue(incoming.Key, mergedValue), nil
+}
+
+// normalizeInstanceSettingMaskPath maps an update_mask path to a field name on the setting's
+// value message. It accepts both value-message-relative paths (e.g. "s3_config") and paths
+// prefixed with the oneof wrapper (e.g. "storage_setting.s3_config"). A path that names the
+// wrapper itself returns "" to signal that the whole value message should be replaced.
+func normalizeInstanceSettingMaskPath(path, wrapperField string) string {
+	p := strings.TrimSpace(path)
+	if wrapperField != "" {
+		if p == wrapperField {
+			return ""
+		}
+		p = strings.TrimPrefix(p, wrapperField+".")
+	}
+	// Collapse any remaining nested path to its top-level value-message field; the whole
+	// field is then merged as a unit, which keeps secret preservation working below.
+	if idx := strings.IndexByte(p, '.'); idx >= 0 {
+		p = p[:idx]
+	}
+	return p
+}
+
+// applyInstanceSettingFieldMask returns a clone of existing with the named top-level fields
+// overwritten by their counterparts from incoming. A masked field that is unset on incoming
+// is cleared. Unknown field names are ignored.
+func applyInstanceSettingFieldMask(existing, incoming proto.Message, fields map[string]bool) proto.Message {
+	result := proto.Clone(existing)
+	resultRefl := result.ProtoReflect()
+	incomingRefl := incoming.ProtoReflect()
+	descriptors := incomingRefl.Descriptor().Fields()
+	for name := range fields {
+		fd := descriptors.ByName(protoreflect.Name(name))
+		if fd == nil {
+			continue
+		}
+		if incomingRefl.Has(fd) {
+			resultRefl.Set(fd, incomingRefl.Get(fd))
+		} else {
+			resultRefl.Clear(fd)
+		}
+	}
+	return result
+}
+
+// existingInstanceSettingValue loads the currently stored value message for the given key,
+// with the store's default values already applied.
+func (s *APIV1Service) existingInstanceSettingValue(ctx context.Context, key storepb.InstanceSettingKey) (proto.Message, error) {
+	switch key {
+	case storepb.InstanceSettingKey_GENERAL:
+		return s.Store.GetInstanceGeneralSetting(ctx)
+	case storepb.InstanceSettingKey_STORAGE:
+		return s.Store.GetInstanceStorageSetting(ctx)
+	case storepb.InstanceSettingKey_MEMO_RELATED:
+		return s.Store.GetInstanceMemoRelatedSetting(ctx)
+	case storepb.InstanceSettingKey_TAGS:
+		return s.Store.GetInstanceTagsSetting(ctx)
+	case storepb.InstanceSettingKey_NOTIFICATION:
+		return s.Store.GetInstanceNotificationSetting(ctx)
+	case storepb.InstanceSettingKey_AI:
+		return s.Store.GetInstanceAISetting(ctx)
+	default:
+		return nil, errors.Errorf("unsupported instance setting key: %v", key)
+	}
+}
+
+// instanceSettingValueFieldName returns the proto oneof field name for a setting key.
+func instanceSettingValueFieldName(key storepb.InstanceSettingKey) string {
+	switch key {
+	case storepb.InstanceSettingKey_GENERAL:
+		return "general_setting"
+	case storepb.InstanceSettingKey_STORAGE:
+		return "storage_setting"
+	case storepb.InstanceSettingKey_MEMO_RELATED:
+		return "memo_related_setting"
+	case storepb.InstanceSettingKey_TAGS:
+		return "tags_setting"
+	case storepb.InstanceSettingKey_NOTIFICATION:
+		return "notification_setting"
+	case storepb.InstanceSettingKey_AI:
+		return "ai_setting"
+	default:
+		return ""
+	}
+}
+
+// instanceSettingValueMessage extracts the concrete value message from a setting, or nil.
+func instanceSettingValueMessage(setting *storepb.InstanceSetting) proto.Message {
+	switch setting.Value.(type) {
+	case *storepb.InstanceSetting_GeneralSetting:
+		return setting.GetGeneralSetting()
+	case *storepb.InstanceSetting_StorageSetting:
+		return setting.GetStorageSetting()
+	case *storepb.InstanceSetting_MemoRelatedSetting:
+		return setting.GetMemoRelatedSetting()
+	case *storepb.InstanceSetting_TagsSetting:
+		return setting.GetTagsSetting()
+	case *storepb.InstanceSetting_NotificationSetting:
+		return setting.GetNotificationSetting()
+	case *storepb.InstanceSetting_AiSetting:
+		return setting.GetAiSetting()
+	default:
+		return nil
+	}
+}
+
+// wrapInstanceSettingValue rebuilds an InstanceSetting from a merged value message.
+func wrapInstanceSettingValue(key storepb.InstanceSettingKey, value proto.Message) *storepb.InstanceSetting {
+	setting := &storepb.InstanceSetting{Key: key}
+	switch v := value.(type) {
+	case *storepb.InstanceGeneralSetting:
+		setting.Value = &storepb.InstanceSetting_GeneralSetting{GeneralSetting: v}
+	case *storepb.InstanceStorageSetting:
+		setting.Value = &storepb.InstanceSetting_StorageSetting{StorageSetting: v}
+	case *storepb.InstanceMemoRelatedSetting:
+		setting.Value = &storepb.InstanceSetting_MemoRelatedSetting{MemoRelatedSetting: v}
+	case *storepb.InstanceTagsSetting:
+		setting.Value = &storepb.InstanceSetting_TagsSetting{TagsSetting: v}
+	case *storepb.InstanceNotificationSetting:
+		setting.Value = &storepb.InstanceSetting_NotificationSetting{NotificationSetting: v}
+	case *storepb.InstanceAISetting:
+		setting.Value = &storepb.InstanceSetting_AiSetting{AiSetting: v}
+	}
+	return setting
 }
 
 func (s *APIV1Service) TestInstanceEmailSetting(ctx context.Context, request *v1pb.TestInstanceEmailSettingRequest) (*emptypb.Empty, error) {
