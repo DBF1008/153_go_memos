@@ -1681,17 +1681,9 @@ func (s *APIV1Service) ListUserNotifications(ctx context.Context, request *v1pb.
 	}
 
 	// Convert storage layer inboxes to API notifications.
-	userIDs := make([]int32, 0, len(inboxes)*2)
-	for _, inbox := range inboxes {
-		userIDs = append(userIDs, inbox.ReceiverID, inbox.SenderID)
-	}
-	usersByID, err := s.listUsersByID(ctx, userIDs)
+	usersByID, memosByID, err := s.prefetchInboxResources(ctx, inboxes)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to list notification users: %v", err)
-	}
-	memosByID, err := s.listMemosByID(ctx, collectInboxMemoIDs(inboxes))
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to list notification memos: %v", err)
+		return nil, status.Errorf(codes.Internal, "failed to load notification resources: %v", err)
 	}
 
 	notifications := []*v1pb.UserNotification{}
@@ -1840,15 +1832,25 @@ func (s *APIV1Service) DeleteUserNotification(ctx context.Context, request *v1pb
 // convertInboxToUserNotification converts a storage-layer inbox to an API notification.
 // This handles the mapping between the internal inbox representation and the public API.
 func (s *APIV1Service) convertInboxToUserNotification(ctx context.Context, inbox *store.Inbox, viewer *store.User) (*v1pb.UserNotification, error) {
-	usersByID, err := s.listUsersByID(ctx, []int32{inbox.ReceiverID, inbox.SenderID})
+	usersByID, memosByID, err := s.prefetchInboxResources(ctx, []*store.Inbox{inbox})
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to list notification users: %v", err)
-	}
-	memosByID, err := s.listMemosByID(ctx, collectInboxMemoIDs([]*store.Inbox{inbox}))
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to list notification memos: %v", err)
+		return nil, status.Errorf(codes.Internal, "failed to load notification resources: %v", err)
 	}
 	return s.convertInboxToUserNotificationWithUsersAndMemos(inbox, viewer, usersByID, memosByID)
+}
+
+// collectInboxUserIDs gathers the user references (receiver and sender) of the
+// given inboxes for batch prefetching. It mirrors collectInboxMemoIDs so both
+// resource kinds are collected from a single, symmetric place.
+func collectInboxUserIDs(inboxes []*store.Inbox) []int32 {
+	userIDs := make([]int32, 0, len(inboxes)*2)
+	for _, inbox := range inboxes {
+		if inbox == nil {
+			continue
+		}
+		userIDs = append(userIDs, inbox.ReceiverID, inbox.SenderID)
+	}
+	return userIDs
 }
 
 func collectInboxMemoIDs(inboxes []*store.Inbox) []int32 {
@@ -1857,22 +1859,28 @@ func collectInboxMemoIDs(inboxes []*store.Inbox) []int32 {
 		if inbox == nil || inbox.Message == nil {
 			continue
 		}
-		switch inbox.Message.Type {
-		case storepb.InboxMessage_MEMO_COMMENT:
-			payload := inbox.Message.GetMemoComment()
-			if payload != nil {
-				memoIDs = append(memoIDs, payload.MemoId, payload.RelatedMemoId)
-			}
-		case storepb.InboxMessage_MEMO_MENTION:
-			payload := inbox.Message.GetMemoMention()
-			if payload != nil {
-				memoIDs = append(memoIDs, payload.MemoId, payload.RelatedMemoId)
-			}
-		default:
-			// Ignore notification types without memo references.
+		handler, ok := inboxNotificationHandlers[inbox.Message.Type]
+		if !ok || handler.memoIDs == nil {
+			continue
 		}
+		memoIDs = append(memoIDs, handler.memoIDs(inbox.Message)...)
 	}
 	return memoIDs
+}
+
+// prefetchInboxResources loads every user and memo referenced by the given
+// inboxes in two batched queries. Both the list-read and single-update paths use
+// it so the conversion has a single resource-loading chain.
+func (s *APIV1Service) prefetchInboxResources(ctx context.Context, inboxes []*store.Inbox) (map[int32]*store.User, map[int32]*store.Memo, error) {
+	usersByID, err := s.listUsersByID(ctx, collectInboxUserIDs(inboxes))
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to list notification users")
+	}
+	memosByID, err := s.listMemosByID(ctx, collectInboxMemoIDs(inboxes))
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to list notification memos")
+	}
+	return usersByID, memosByID, nil
 }
 
 func (s *APIV1Service) convertInboxToUserNotificationWithUsersAndMemos(inbox *store.Inbox, viewer *store.User, usersByID map[int32]*store.User, memosByID map[int32]*store.Memo) (*v1pb.UserNotification, error) {
@@ -1902,32 +1910,16 @@ func (s *APIV1Service) convertInboxToUserNotificationWithUsersAndMemos(inbox *st
 		notification.Status = v1pb.UserNotification_STATUS_UNSPECIFIED
 	}
 
-	// Extract notification type and payload from the inbox message.
+	// Extract notification type and payload from the inbox message via the handler registry.
 	if inbox.Message != nil {
-		switch inbox.Message.Type {
-		case storepb.InboxMessage_MEMO_COMMENT:
-			notification.Type = v1pb.UserNotification_MEMO_COMMENT
-			payload, err := s.convertMemoCommentNotificationPayload(viewer, inbox.Message, memosByID)
-			if err != nil {
-				return nil, err
-			}
-			if payload != nil {
-				notification.Payload = &v1pb.UserNotification_MemoComment{
-					MemoComment: payload,
+		if handler, ok := inboxNotificationHandlers[inbox.Message.Type]; ok {
+			notification.Type = handler.apiType
+			if handler.apply != nil {
+				if err := handler.apply(s, viewer, inbox.Message, memosByID, notification); err != nil {
+					return nil, err
 				}
 			}
-		case storepb.InboxMessage_MEMO_MENTION:
-			notification.Type = v1pb.UserNotification_MEMO_MENTION
-			payload, err := s.convertMemoMentionNotificationPayload(viewer, inbox.Message, memosByID)
-			if err != nil {
-				return nil, err
-			}
-			if payload != nil {
-				notification.Payload = &v1pb.UserNotification_MemoMention{
-					MemoMention: payload,
-				}
-			}
-		default:
+		} else {
 			notification.Type = v1pb.UserNotification_TYPE_UNSPECIFIED
 		}
 	}
@@ -1963,70 +1955,115 @@ func (s *APIV1Service) memoNotificationSnippet(memo *store.Memo) (string, error)
 	return snippet, nil
 }
 
-func (s *APIV1Service) convertMemoCommentNotificationPayload(viewer *store.User, message *storepb.InboxMessage, memosByID map[int32]*store.Memo) (*v1pb.UserNotification_MemoCommentPayload, error) {
-	memoComment := message.GetMemoComment()
-	if message == nil || message.Type != storepb.InboxMessage_MEMO_COMMENT || memoComment == nil {
-		return nil, nil
-	}
-
-	commentMemo := memosByID[memoComment.MemoId]
-	if !canViewerAccessMemo(viewer, commentMemo) {
-		return nil, nil
-	}
-
-	relatedMemo := memosByID[memoComment.RelatedMemoId]
-	if !canViewerAccessMemo(viewer, relatedMemo) {
-		return nil, nil
-	}
-
-	memoSnippet, err := s.memoNotificationSnippet(commentMemo)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get comment memo snippet")
-	}
-	relatedMemoSnippet, err := s.memoNotificationSnippet(relatedMemo)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get related memo snippet")
-	}
-
-	return &v1pb.UserNotification_MemoCommentPayload{
-		Memo:               fmt.Sprintf("%s%s", MemoNamePrefix, commentMemo.UID),
-		RelatedMemo:        fmt.Sprintf("%s%s", MemoNamePrefix, relatedMemo.UID),
-		MemoSnippet:        memoSnippet,
-		RelatedMemoSnippet: relatedMemoSnippet,
-	}, nil
+// inboxNotificationHandler describes how a single inbox message type is projected
+// onto the API UserNotification: its API type, which memos it references (for batch
+// prefetching), and how to populate its payload. Adding a new notification type
+// means adding one entry to inboxNotificationHandlers and nothing else.
+type inboxNotificationHandler struct {
+	apiType v1pb.UserNotification_Type
+	memoIDs func(msg *storepb.InboxMessage) []int32
+	apply   func(s *APIV1Service, viewer *store.User, msg *storepb.InboxMessage, memosByID map[int32]*store.Memo, notification *v1pb.UserNotification) error
 }
 
-func (s *APIV1Service) convertMemoMentionNotificationPayload(viewer *store.User, message *storepb.InboxMessage, memosByID map[int32]*store.Memo) (*v1pb.UserNotification_MemoMentionPayload, error) {
-	memoMention := message.GetMemoMention()
-	if message == nil || message.Type != storepb.InboxMessage_MEMO_MENTION || memoMention == nil {
-		return nil, nil
-	}
-
-	memo := memosByID[memoMention.MemoId]
-	if !canViewerAccessMemo(viewer, memo) {
-		return nil, nil
-	}
-
-	memoSnippet, err := s.memoNotificationSnippet(memo)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get mention memo snippet")
-	}
-
-	payload := &v1pb.UserNotification_MemoMentionPayload{
-		Memo:        fmt.Sprintf("%s%s", MemoNamePrefix, memo.UID),
-		MemoSnippet: memoSnippet,
-	}
-	if memoMention.RelatedMemoId != 0 {
-		relatedMemo := memosByID[memoMention.RelatedMemoId]
-		if canViewerAccessMemo(viewer, relatedMemo) {
-			payload.RelatedMemo = fmt.Sprintf("%s%s", MemoNamePrefix, relatedMemo.UID)
-			relatedMemoSnippet, err := s.memoNotificationSnippet(relatedMemo)
-			if err != nil {
-				return nil, errors.Wrap(err, "failed to get related memo snippet")
+var inboxNotificationHandlers = map[storepb.InboxMessage_Type]inboxNotificationHandler{
+	storepb.InboxMessage_MEMO_COMMENT: {
+		apiType: v1pb.UserNotification_MEMO_COMMENT,
+		memoIDs: func(msg *storepb.InboxMessage) []int32 {
+			payload := msg.GetMemoComment()
+			if payload == nil {
+				return nil
 			}
-			payload.RelatedMemoSnippet = relatedMemoSnippet
-		}
-	}
+			return []int32{payload.MemoId, payload.RelatedMemoId}
+		},
+		apply: func(s *APIV1Service, viewer *store.User, msg *storepb.InboxMessage, memosByID map[int32]*store.Memo, notification *v1pb.UserNotification) error {
+			payload := msg.GetMemoComment()
+			if payload == nil {
+				return nil
+			}
+			// A comment notification needs both the comment memo and the memo it
+			// replies to; if either is missing or hidden, the payload is omitted.
+			memoName, memoSnippet, ok, err := s.resolveNotificationMemo(viewer, memosByID, payload.MemoId)
+			if err != nil {
+				return errors.Wrap(err, "failed to resolve comment memo")
+			}
+			if !ok {
+				return nil
+			}
+			relatedName, relatedSnippet, ok, err := s.resolveNotificationMemo(viewer, memosByID, payload.RelatedMemoId)
+			if err != nil {
+				return errors.Wrap(err, "failed to resolve related memo")
+			}
+			if !ok {
+				return nil
+			}
+			notification.Payload = &v1pb.UserNotification_MemoComment{
+				MemoComment: &v1pb.UserNotification_MemoCommentPayload{
+					Memo:               memoName,
+					RelatedMemo:        relatedName,
+					MemoSnippet:        memoSnippet,
+					RelatedMemoSnippet: relatedSnippet,
+				},
+			}
+			return nil
+		},
+	},
+	storepb.InboxMessage_MEMO_MENTION: {
+		apiType: v1pb.UserNotification_MEMO_MENTION,
+		memoIDs: func(msg *storepb.InboxMessage) []int32 {
+			payload := msg.GetMemoMention()
+			if payload == nil {
+				return nil
+			}
+			return []int32{payload.MemoId, payload.RelatedMemoId}
+		},
+		apply: func(s *APIV1Service, viewer *store.User, msg *storepb.InboxMessage, memosByID map[int32]*store.Memo, notification *v1pb.UserNotification) error {
+			payload := msg.GetMemoMention()
+			if payload == nil {
+				return nil
+			}
+			// The mentioned memo is required; the related memo is optional and only
+			// attached when present and visible to the viewer.
+			memoName, memoSnippet, ok, err := s.resolveNotificationMemo(viewer, memosByID, payload.MemoId)
+			if err != nil {
+				return errors.Wrap(err, "failed to resolve mention memo")
+			}
+			if !ok {
+				return nil
+			}
+			mentionPayload := &v1pb.UserNotification_MemoMentionPayload{
+				Memo:        memoName,
+				MemoSnippet: memoSnippet,
+			}
+			if payload.RelatedMemoId != 0 {
+				relatedName, relatedSnippet, ok, err := s.resolveNotificationMemo(viewer, memosByID, payload.RelatedMemoId)
+				if err != nil {
+					return errors.Wrap(err, "failed to resolve related memo")
+				}
+				if ok {
+					mentionPayload.RelatedMemo = relatedName
+					mentionPayload.RelatedMemoSnippet = relatedSnippet
+				}
+			}
+			notification.Payload = &v1pb.UserNotification_MemoMention{
+				MemoMention: mentionPayload,
+			}
+			return nil
+		},
+	},
+}
 
-	return payload, nil
+// resolveNotificationMemo looks up a referenced memo, enforces viewer access, and
+// builds its API resource name and content snippet. ok is false when the memo is
+// missing or not visible to the viewer, which callers use to degrade gracefully by
+// omitting the payload.
+func (s *APIV1Service) resolveNotificationMemo(viewer *store.User, memosByID map[int32]*store.Memo, memoID int32) (string, string, bool, error) {
+	memo := memosByID[memoID]
+	if !canViewerAccessMemo(viewer, memo) {
+		return "", "", false, nil
+	}
+	snippet, err := s.memoNotificationSnippet(memo)
+	if err != nil {
+		return "", "", false, err
+	}
+	return fmt.Sprintf("%s%s", MemoNamePrefix, memo.UID), snippet, true, nil
 }
