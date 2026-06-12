@@ -84,16 +84,61 @@ func (s *APIV1Service) ListUsers(ctx context.Context, request *v1pb.ListUsersReq
 		}
 	}
 
+	// By default only active (NORMAL) users are returned. When show_deleted is
+	// requested, archived users are included as well by leaving RowStatus unset.
+	if !request.ShowDeleted {
+		normal := store.Normal
+		userFind.RowStatus = &normal
+	}
+
+	// total_size reflects the full result set for the applied filters, independent
+	// of the current page.
+	totalUsers, err := s.Store.ListUsers(ctx, &store.FindUser{
+		Username:  userFind.Username,
+		RowStatus: userFind.RowStatus,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to count users: %v", err)
+	}
+
+	var limit, offset int
+	if request.PageToken != "" {
+		var pageToken v1pb.PageToken
+		if err := unmarshalPageToken(request.PageToken, &pageToken); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid page token: %v", err)
+		}
+		limit = normalizePageSize(pageToken.Limit)
+		offset = int(pageToken.Offset)
+		if offset < 0 {
+			offset = 0
+		}
+	} else {
+		limit = normalizePageSize(request.PageSize)
+	}
+	limit = min(limit, MaxPageSize)
+	// Fetch one extra row to detect whether a subsequent page exists.
+	limitPlusOne := limit + 1
+	userFind.Limit = &limitPlusOne
+	userFind.Offset = &offset
+
 	users, err := s.Store.ListUsers(ctx, userFind)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list users: %v", err)
 	}
 
-	// TODO: Implement proper ordering, and pagination
-	// For now, return all users with basic structure
+	nextPageToken := ""
+	if len(users) == limitPlusOne {
+		users = users[:limit]
+		nextPageToken, err = getPageToken(limit, offset+limit)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to get next page token: %v", err)
+		}
+	}
+
 	response := &v1pb.ListUsersResponse{
-		Users:     []*v1pb.User{},
-		TotalSize: int32(len(users)),
+		Users:         make([]*v1pb.User, 0, len(users)),
+		NextPageToken: nextPageToken,
+		TotalSize:     int32(len(totalUsers)),
 	}
 	for _, user := range users {
 		response.Users = append(response.Users, convertUserFromStore(user, currentUser))
