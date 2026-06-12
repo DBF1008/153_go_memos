@@ -2,7 +2,8 @@
 
 This package serves an [OpenAPI](https://www.openapis.org/)-driven
 [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) endpoint at
-`/mcp`. It exposes a curated, memo-focused toolset over the **Streamable HTTP**
+`/mcp`. It exposes a curated toolset — memos, attachments, plus the caller's own
+notifications (inbox) and webhooks — over the **Streamable HTTP**
 transport using the official `github.com/modelcontextprotocol/go-sdk`.
 
 The core design principle: **tool calls execute in-process against the existing
@@ -131,8 +132,10 @@ a personal access token as a bearer credential. Example client config:
 
 ## Tool surface
 
-The first version exposes a curated allowlist (`curatedOperationIDs` in
-`catalog.go`), all memo- and attachment-focused:
+The curated allowlist (`curatedOperationIDs` in `catalog.go`) covers memos,
+attachments, and the caller's own notifications (inbox) and webhooks. The
+broader `UserService` surface (user CRUD, personal access tokens, settings,
+linked identities) is deliberately kept off the toolset:
 
 | OpenAPI operation | MCP tool |
 | --- | --- |
@@ -153,6 +156,13 @@ The first version exposes a curated allowlist (`curatedOperationIDs` in
 | `AttachmentService_ListAttachments` | `attachment_list_attachments` |
 | `AttachmentService_GetAttachment` | `attachment_get_attachment` |
 | `AttachmentService_DeleteAttachment` | `attachment_delete_attachment` |
+| `UserService_ListUserNotifications` | `user_list_user_notifications` |
+| `UserService_UpdateUserNotification` | `user_update_user_notification` |
+| `UserService_DeleteUserNotification` | `user_delete_user_notification` |
+| `UserService_ListUserWebhooks` | `user_list_user_webhooks` |
+| `UserService_CreateUserWebhook` | `user_create_user_webhook` |
+| `UserService_UpdateUserWebhook` | `user_update_user_webhook` |
+| `UserService_DeleteUserWebhook` | `user_delete_user_webhook` |
 
 **Naming rule** (`toolNameFromOperationID`): drop the `Service` suffix from the
 subject and convert both subject and method from camelCase to snake_case, joined

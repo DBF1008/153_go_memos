@@ -141,8 +141,18 @@ func TestMCPProtocolListsCuratedToolsOnly(t *testing.T) {
 	}
 	require.Contains(t, names, "memo_list_memos")
 	require.Contains(t, names, "memo_create_memo")
+	require.Contains(t, names, "user_list_user_notifications")
+	require.Contains(t, names, "user_update_user_notification")
+	require.Contains(t, names, "user_delete_user_notification")
+	require.Contains(t, names, "user_list_user_webhooks")
+	require.Contains(t, names, "user_create_user_webhook")
+	require.Contains(t, names, "user_update_user_webhook")
+	require.Contains(t, names, "user_delete_user_webhook")
 	require.NotContains(t, names, "auth_sign_in")
 	require.NotContains(t, names, "user_create_user")
+	require.NotContains(t, names, "user_delete_user")
+	require.NotContains(t, names, "user_list_users")
+	require.NotContains(t, names, "user_list_personal_access_tokens")
 }
 
 func TestMCPToolCallReturnsObjectStructuredContent(t *testing.T) {
@@ -246,6 +256,173 @@ func TestMCPToolCallRejectsInvalidArguments(t *testing.T) {
 	require.Zero(t, routeHits)
 }
 
+func TestMCPProtocolCallsListUserNotifications(t *testing.T) {
+	echoServer := echo.New()
+	echoServer.GET("/api/v1/users/:user/notifications", func(c *echo.Context) error {
+		require.Equal(t, "me", c.Param("user"))
+		require.Equal(t, "5", c.QueryParam("pageSize"))
+		return c.JSON(http.StatusOK, map[string]any{
+			"notifications": []any{
+				map[string]any{"name": "users/me/notifications/1", "status": "UNREAD"},
+			},
+			"nextPageToken": "",
+		})
+	})
+
+	service, err := NewMCPService(&profile.Profile{Version: "test-version"}, echoServer)
+	require.NoError(t, err)
+	service.RegisterRoutes(echoServer)
+
+	initializeMCP(t, echoServer)
+	response := postMCP(t, echoServer, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "user_list_user_notifications",
+			"arguments": map[string]any{
+				"user":     "me",
+				"pageSize": 5,
+			},
+		},
+	})
+
+	result, ok := response["result"].(map[string]any)
+	require.True(t, ok)
+	require.NotEqual(t, true, result["isError"])
+	require.Equal(t, map[string]any{
+		"notifications": []any{
+			map[string]any{"name": "users/me/notifications/1", "status": "UNREAD"},
+		},
+		"nextPageToken": "",
+	}, result["structuredContent"])
+}
+
+func TestMCPProtocolCallsUpdateUserNotificationMarksRead(t *testing.T) {
+	echoServer := echo.New()
+	echoServer.PATCH("/api/v1/users/:user/notifications/:notification", func(c *echo.Context) error {
+		require.Equal(t, "me", c.Param("user"))
+		require.Equal(t, "42", c.Param("notification"))
+		require.Equal(t, "status", c.QueryParam("updateMask"))
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(c.Request().Body).Decode(&body))
+		require.Equal(t, "ARCHIVED", body["status"])
+		return c.JSON(http.StatusOK, map[string]any{
+			"name":   "users/me/notifications/42",
+			"status": "ARCHIVED",
+		})
+	})
+
+	service, err := NewMCPService(&profile.Profile{Version: "test-version"}, echoServer)
+	require.NoError(t, err)
+	service.RegisterRoutes(echoServer)
+
+	initializeMCP(t, echoServer)
+	response := postMCP(t, echoServer, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "user_update_user_notification",
+			"arguments": map[string]any{
+				"user":         "me",
+				"notification": "42",
+				"updateMask":   "status",
+				"body": map[string]any{
+					"status": "ARCHIVED",
+				},
+			},
+		},
+	})
+
+	result, ok := response["result"].(map[string]any)
+	require.True(t, ok)
+	require.NotEqual(t, true, result["isError"])
+	require.Equal(t, map[string]any{
+		"name":   "users/me/notifications/42",
+		"status": "ARCHIVED",
+	}, result["structuredContent"])
+}
+
+func TestMCPProtocolCallsDeleteUserNotificationNormalizesEmptyResult(t *testing.T) {
+	echoServer := echo.New()
+	echoServer.DELETE("/api/v1/users/:user/notifications/:notification", func(c *echo.Context) error {
+		require.Equal(t, "me", c.Param("user"))
+		require.Equal(t, "42", c.Param("notification"))
+		return c.NoContent(http.StatusOK)
+	})
+
+	service, err := NewMCPService(&profile.Profile{Version: "test-version"}, echoServer)
+	require.NoError(t, err)
+	service.RegisterRoutes(echoServer)
+
+	initializeMCP(t, echoServer)
+	response := postMCP(t, echoServer, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "user_delete_user_notification",
+			"arguments": map[string]any{
+				"user":         "me",
+				"notification": "42",
+			},
+		},
+	})
+
+	result, ok := response["result"].(map[string]any)
+	require.True(t, ok)
+	require.NotEqual(t, true, result["isError"])
+	require.Equal(t, map[string]any{"ok": true}, result["structuredContent"])
+}
+
+func TestMCPProtocolCallsCreateUserWebhookForwardsBodyAndAuthorization(t *testing.T) {
+	echoServer := echo.New()
+	echoServer.POST("/api/v1/users/:user/webhooks", func(c *echo.Context) error {
+		require.Equal(t, "me", c.Param("user"))
+		require.Equal(t, "Bearer pat-token", c.Request().Header.Get("Authorization"))
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(c.Request().Body).Decode(&body))
+		require.Equal(t, "https://example.com/hook", body["url"])
+		require.Equal(t, "CI bot", body["displayName"])
+		return c.JSON(http.StatusOK, map[string]any{
+			"name":        "users/me/webhooks/1",
+			"url":         body["url"],
+			"displayName": body["displayName"],
+		})
+	})
+
+	service, err := NewMCPService(&profile.Profile{Version: "test-version"}, echoServer)
+	require.NoError(t, err)
+	service.RegisterRoutes(echoServer)
+
+	initializeMCP(t, echoServer)
+	response := postMCPWithHeaders(t, echoServer, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "user_create_user_webhook",
+			"arguments": map[string]any{
+				"user": "me",
+				"body": map[string]any{
+					"url":         "https://example.com/hook",
+					"displayName": "CI bot",
+				},
+			},
+		},
+	}, map[string]string{"Authorization": "Bearer pat-token"})
+
+	result, ok := response["result"].(map[string]any)
+	require.True(t, ok)
+	require.NotEqual(t, true, result["isError"])
+	require.Equal(t, map[string]any{
+		"name":        "users/me/webhooks/1",
+		"url":         "https://example.com/hook",
+		"displayName": "CI bot",
+	}, result["structuredContent"])
+}
+
 func initializeMCP(t *testing.T, echoServer *echo.Echo) {
 	t.Helper()
 	response := postMCP(t, echoServer, map[string]any{
@@ -266,12 +443,20 @@ func initializeMCP(t *testing.T, echoServer *echo.Echo) {
 
 func postMCP(t *testing.T, echoServer *echo.Echo, payload map[string]any) map[string]any {
 	t.Helper()
+	return postMCPWithHeaders(t, echoServer, payload, nil)
+}
+
+func postMCPWithHeaders(t *testing.T, echoServer *echo.Echo, payload map[string]any, headers map[string]string) map[string]any {
+	t.Helper()
 	data, err := json.Marshal(payload)
 	require.NoError(t, err)
 
 	request := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(data))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json, text/event-stream")
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
 
 	recorder := httptest.NewRecorder()
 	echoServer.ServeHTTP(recorder, request)

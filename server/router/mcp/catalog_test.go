@@ -2,28 +2,50 @@ package mcp
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
 )
 
-func TestCuratedOperationIDsStayMemoFocused(t *testing.T) {
-	require.Len(t, curatedOperationIDs, 17)
+func TestCuratedOperationIDsAreSafelyScoped(t *testing.T) {
+	require.Len(t, curatedOperationIDs, 24)
+
+	// The only UserService operations exposed on the MCP surface are the user's
+	// own notifications (inbox) and webhooks. Everything else under UserService
+	// (user CRUD, personal access tokens, settings, linked identities, stats)
+	// must stay off the surface.
+	allowedUserOperations := map[string]struct{}{
+		"UserService_ListUserNotifications":  {},
+		"UserService_UpdateUserNotification": {},
+		"UserService_DeleteUserNotification": {},
+		"UserService_ListUserWebhooks":       {},
+		"UserService_CreateUserWebhook":      {},
+		"UserService_UpdateUserWebhook":      {},
+		"UserService_DeleteUserWebhook":      {},
+	}
 
 	for _, operationID := range curatedOperationIDs {
 		require.NotContains(t, operationID, "Admin")
 		require.NotContains(t, operationID, "AuthService_")
-		require.NotContains(t, operationID, "UserService_")
 		require.NotContains(t, operationID, "AIService_")
 		require.NotContains(t, operationID, "IdentityProviderService_")
 		require.NotContains(t, operationID, "InstanceService_")
 		require.NotContains(t, operationID, "PersonalAccessToken")
 		require.NotContains(t, operationID, "PAT")
-		require.NotContains(t, operationID, "Webhook")
 		require.NotContains(t, operationID, "Share")
 		require.NotContains(t, operationID, "BatchDelete")
 		require.NotContains(t, operationID, "Transcribe")
+
+		if strings.HasPrefix(operationID, "UserService_") {
+			_, ok := allowedUserOperations[operationID]
+			require.Truef(t, ok, "unexpected UserService operation on MCP surface: %s", operationID)
+		}
+	}
+
+	for operationID := range allowedUserOperations {
+		require.Contains(t, curatedOperationIDs, operationID)
 	}
 }
 
@@ -95,6 +117,91 @@ func TestBuildToolFromOperationIncludesRequestBodySchema(t *testing.T) {
 			"state":      "NORMAL",
 			"content":    "hello",
 			"visibility": "PRIVATE",
+		},
+	})
+	require.NoError(t, err)
+}
+
+func TestBuildToolForUserNotificationList(t *testing.T) {
+	spec, err := loadOpenAPISpec("../../../proto/gen/openapi.yaml")
+	require.NoError(t, err)
+	registry, err := buildOperationRegistry(spec)
+	require.NoError(t, err)
+
+	tool, operation := buildToolFromOperation(registry["UserService_ListUserNotifications"])
+	require.Equal(t, "user_list_user_notifications", tool.Name)
+	require.Equal(t, "GET", operation.Method)
+	require.Equal(t, "/api/v1/users/{user}/notifications", operation.Path)
+	require.True(t, tool.Annotations.ReadOnlyHint)
+	require.False(t, *tool.Annotations.DestructiveHint)
+
+	input, ok := tool.InputSchema.(jsonSchema)
+	require.True(t, ok)
+	require.Contains(t, input["required"], "user")
+	properties, ok := input["properties"].(map[string]any)
+	require.True(t, ok)
+	require.Contains(t, properties, "user")
+	require.Contains(t, properties, "pageSize")
+	require.Contains(t, properties, "filter")
+
+	outputBytes, err := json.Marshal(tool.OutputSchema)
+	require.NoError(t, err)
+	require.Contains(t, string(outputBytes), `"notifications"`)
+}
+
+func TestBuildToolForUserNotificationDeleteIsDestructive(t *testing.T) {
+	spec, err := loadOpenAPISpec("../../../proto/gen/openapi.yaml")
+	require.NoError(t, err)
+	registry, err := buildOperationRegistry(spec)
+	require.NoError(t, err)
+
+	tool, operation := buildToolFromOperation(registry["UserService_DeleteUserNotification"])
+	require.Equal(t, "user_delete_user_notification", tool.Name)
+	require.Equal(t, "DELETE", operation.Method)
+	require.False(t, tool.Annotations.ReadOnlyHint)
+	require.True(t, *tool.Annotations.DestructiveHint)
+
+	input, ok := tool.InputSchema.(jsonSchema)
+	require.True(t, ok)
+	require.Contains(t, input["required"], "user")
+	require.Contains(t, input["required"], "notification")
+}
+
+func TestBuildToolForUserWebhookCreate(t *testing.T) {
+	spec, err := loadOpenAPISpec("../../../proto/gen/openapi.yaml")
+	require.NoError(t, err)
+	registry, err := buildOperationRegistry(spec)
+	require.NoError(t, err)
+
+	tool, operation := buildToolFromOperation(registry["UserService_CreateUserWebhook"])
+	require.Equal(t, "user_create_user_webhook", tool.Name)
+	require.Equal(t, "POST", operation.Method)
+	require.Equal(t, "/api/v1/users/{user}/webhooks", operation.Path)
+	require.False(t, tool.Annotations.ReadOnlyHint)
+	require.False(t, *tool.Annotations.DestructiveHint)
+
+	input, ok := tool.InputSchema.(jsonSchema)
+	require.True(t, ok)
+	require.Contains(t, input["required"], "user")
+	require.Contains(t, input["required"], "body")
+	properties, ok := input["properties"].(map[string]any)
+	require.True(t, ok)
+	require.Contains(t, properties, "user")
+	body, ok := properties["body"].(jsonSchema)
+	require.True(t, ok)
+	require.Equal(t, "object", body["type"])
+	require.Contains(t, body["properties"], "url")
+	require.Contains(t, body["properties"], "displayName")
+
+	outputBytes, err := json.Marshal(tool.OutputSchema)
+	require.NoError(t, err)
+	require.Contains(t, string(outputBytes), `"url"`)
+
+	err = validateToolArguments(input, map[string]any{
+		"user": "me",
+		"body": map[string]any{
+			"displayName": "CI bot",
+			"url":         "https://example.com/hook",
 		},
 	})
 	require.NoError(t, err)

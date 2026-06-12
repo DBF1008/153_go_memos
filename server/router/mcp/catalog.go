@@ -26,6 +26,17 @@ var curatedOperationIDs = []string{
 	"AttachmentService_ListAttachments",
 	"AttachmentService_GetAttachment",
 	"AttachmentService_DeleteAttachment",
+	// User notifications (inbox): read, mark read/archived, and dismiss. These are
+	// the only UserService operations exposed besides webhooks; broader user
+	// management (CRUD, PATs, settings, linked identities) stays off the surface.
+	"UserService_ListUserNotifications",
+	"UserService_UpdateUserNotification",
+	"UserService_DeleteUserNotification",
+	// User webhooks: full self-service management for automation workflows.
+	"UserService_ListUserWebhooks",
+	"UserService_CreateUserWebhook",
+	"UserService_UpdateUserWebhook",
+	"UserService_DeleteUserWebhook",
 }
 
 type registeredOperation struct {
