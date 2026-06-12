@@ -26,6 +26,13 @@ var curatedOperationIDs = []string{
 	"AttachmentService_ListAttachments",
 	"AttachmentService_GetAttachment",
 	"AttachmentService_DeleteAttachment",
+	"UserService_ListUserNotifications",
+	"UserService_DeleteUserNotification",
+	"UserService_UpdateUserNotification",
+	"UserService_ListUserWebhooks",
+	"UserService_CreateUserWebhook",
+	"UserService_UpdateUserWebhook",
+	"UserService_DeleteUserWebhook",
 }
 
 type registeredOperation struct {

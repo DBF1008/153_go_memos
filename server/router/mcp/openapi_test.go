@@ -32,6 +32,13 @@ func TestLoadOpenAPIOperationsIncludesCuratedIDs(t *testing.T) {
 		"AttachmentService_ListAttachments",
 		"AttachmentService_GetAttachment",
 		"AttachmentService_DeleteAttachment",
+		"UserService_ListUserNotifications",
+		"UserService_DeleteUserNotification",
+		"UserService_UpdateUserNotification",
+		"UserService_ListUserWebhooks",
+		"UserService_CreateUserWebhook",
+		"UserService_UpdateUserWebhook",
+		"UserService_DeleteUserWebhook",
 	}
 
 	for _, operationID := range curatedIDs {
@@ -46,6 +53,22 @@ func TestLoadOpenAPIOperationsIncludesCuratedIDs(t *testing.T) {
 	createMemo := registry["MemoService_CreateMemo"]
 	require.NotNil(t, createMemo.RequestBodySchema)
 	require.Equal(t, "object", createMemo.RequestBodySchema["type"])
+
+	createWebhook := registry["UserService_CreateUserWebhook"]
+	require.NotNil(t, createWebhook.RequestBodySchema)
+	require.Equal(t, "object", createWebhook.RequestBodySchema["type"])
+
+	updateNotification := registry["UserService_UpdateUserNotification"]
+	require.NotNil(t, updateNotification.RequestBodySchema)
+	require.Equal(t, "object", updateNotification.RequestBodySchema["type"])
+
+	listNotifications := registry["UserService_ListUserNotifications"]
+	require.NotNil(t, listNotifications.ResponseSchema)
+	require.Equal(t, "object", listNotifications.ResponseSchema["type"])
+
+	listWebhooks := registry["UserService_ListUserWebhooks"]
+	require.NotNil(t, listWebhooks.ResponseSchema)
+	require.Equal(t, "object", listWebhooks.ResponseSchema["type"])
 }
 
 func TestBuildOperationRegistryRejectsDuplicateOperationIDs(t *testing.T) {
