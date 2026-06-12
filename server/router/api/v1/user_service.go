@@ -486,15 +486,20 @@ func (s *APIV1Service) resolveUserAndSettingKeyFromName(ctx context.Context, nam
 
 func (s *APIV1Service) resolveUserAndWebhookIDFromName(ctx context.Context, name string) (*store.User, string, error) {
 	parts := strings.Split(name, "/")
-	if len(parts) != 4 || parts[0] != "users" || parts[2] != "webhooks" {
-		return nil, "", errors.New("invalid webhook name format")
+	if len(parts) != 4 || parts[0] != "users" {
+		return nil, "", errors.Errorf("invalid webhook name format: %q", name)
+	}
+
+	webhookID, err := extractWebhookIDFromName(name)
+	if err != nil {
+		return nil, "", err
 	}
 
 	user, err := s.resolveUserFromName(ctx, BuildUserName(parts[1]))
 	if err != nil {
 		return nil, "", err
 	}
-	return user, parts[3], nil
+	return user, webhookID, nil
 }
 
 func (s *APIV1Service) resolveUserAndLinkedIdentityProviderFromName(ctx context.Context, name string) (*store.User, string, error) {
@@ -1268,14 +1273,19 @@ func generateUserWebhookID() string {
 	return hex.EncodeToString(b)
 }
 
-// convertUserWebhookFromUserSetting converts a storepb webhook to a v1pb UserWebhook.
+// convertUserWebhookFromUserSetting converts a store-layer webhook to its API
+// representation. It is the single canonical conversion used by both the
+// dedicated webhook CRUD endpoints and the user-settings read path.
+//
+// SigningSecret is deliberately NOT populated here: the proto field carries
+// the INPUT_ONLY annotation, meaning the secret is accepted on write
+// (create / update) but must never be returned in any API response.
 func convertUserWebhookFromUserSetting(webhook *storepb.WebhooksUserSetting_Webhook, user *store.User) *v1pb.UserWebhook {
 	return &v1pb.UserWebhook{
 		Name:        fmt.Sprintf("%s/webhooks/%s", BuildUserName(user.Username), webhook.Id),
 		Url:         webhook.Url,
 		DisplayName: webhook.Title,
-		// Note: create_time and update_time are not available in the user setting webhook structure
-		// This is a limitation of storing webhooks in user settings vs the dedicated webhook table
+		// create_time and update_time are not stored in the user-setting blob.
 	}
 }
 
@@ -1468,13 +1478,11 @@ func convertUserSettingFromStore(storeSetting *storepb.UserSetting, user *store.
 		apiWebhooks := make([]*v1pb.UserWebhook, 0)
 		if webhooks != nil {
 			apiWebhooks = make([]*v1pb.UserWebhook, 0, len(webhooks.Webhooks))
-			for _, webhook := range webhooks.Webhooks {
-				apiWebhook := &v1pb.UserWebhook{
-					Name:        fmt.Sprintf("%s/webhooks/%s", BuildUserName(user.Username), webhook.Id),
-					Url:         webhook.Url,
-					DisplayName: webhook.Title,
-				}
-				apiWebhooks = append(apiWebhooks, apiWebhook)
+			for _, wh := range webhooks.Webhooks {
+				// Use the single canonical conversion so field mappings and
+				// signing-secret omission stay consistent with the dedicated
+				// webhook CRUD endpoints.
+				apiWebhooks = append(apiWebhooks, convertUserWebhookFromUserSetting(wh, user))
 			}
 		}
 		setting.Value = &v1pb.UserSetting_WebhooksSetting_{
@@ -1516,11 +1524,20 @@ func convertUserSettingToStore(apiSetting *v1pb.UserSetting, userID int32, key s
 	case storepb.UserSetting_WEBHOOKS:
 		if webhooks := apiSetting.GetWebhooksSetting(); webhooks != nil {
 			storeWebhooks := make([]*storepb.WebhooksUserSetting_Webhook, 0, len(webhooks.Webhooks))
-			for _, webhook := range webhooks.Webhooks {
+			for _, wh := range webhooks.Webhooks {
+				id, err := extractWebhookIDFromName(wh.Name)
+				if err != nil {
+					return nil, err
+				}
 				storeWebhook := &storepb.WebhooksUserSetting_Webhook{
-					Id:    extractWebhookIDFromName(webhook.Name),
-					Title: webhook.DisplayName,
-					Url:   webhook.Url,
+					Id:    id,
+					Title: wh.DisplayName,
+					Url:   wh.Url,
+					// SigningSecret is INPUT_ONLY on the API side: clients send it
+					// on write but the server never returns it on read. We must
+					// still persist it here so that a full-replace via user
+					// settings does not silently wipe existing secrets.
+					SigningSecret: wh.SigningSecret,
 				}
 				storeWebhooks = append(storeWebhooks, storeWebhook)
 			}
@@ -1547,14 +1564,16 @@ func convertUserSettingToStore(apiSetting *v1pb.UserSetting, userID int32, key s
 	return storeSetting, nil
 }
 
-// extractWebhookIDFromName extracts webhook ID from resource name.
-// e.g., "users/123/webhooks/webhook-id" -> "webhook-id".
-func extractWebhookIDFromName(name string) string {
+// extractWebhookIDFromName parses a webhook resource name of the form
+// "users/{username}/webhooks/{webhookID}" and returns the bare webhook ID.
+// It is the single parser used by both the dedicated webhook endpoints and
+// the user-settings conversion path.
+func extractWebhookIDFromName(name string) (string, error) {
 	parts := strings.Split(name, "/")
-	if len(parts) >= 4 && parts[0] == "users" && parts[2] == "webhooks" {
-		return parts[3]
+	if len(parts) != 4 || parts[0] != "users" || parts[2] != "webhooks" || parts[3] == "" {
+		return "", errors.Errorf("invalid webhook name format: %q", name)
 	}
-	return ""
+	return parts[3], nil
 }
 
 // extractUsernameFromFilter extracts username from the filter string using CEL.
