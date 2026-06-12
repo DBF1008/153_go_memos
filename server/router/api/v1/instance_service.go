@@ -12,6 +12,7 @@ import (
 	colorpb "google.golang.org/genproto/googleapis/type/color"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	v1pb "github.com/usememos/memos/proto/gen/api/v1"
@@ -178,24 +179,106 @@ func (s *APIV1Service) UpdateInstanceSetting(ctx context.Context, request *v1pb.
 		return nil, status.Errorf(codes.PermissionDenied, "permission denied")
 	}
 
-	// TODO: Apply update_mask if specified
-	_ = request.UpdateMask
-
 	if err := validateInstanceSetting(request.Setting); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid instance setting: %v", err)
 	}
 
-	updateSetting := convertInstanceSettingToStore(request.Setting)
+	var updateSetting *storepb.InstanceSetting
 
-	// Preserve write-only credential fields when the caller sends an empty value.
-	// An empty string means "no change", not "clear the credential".
+	hasUpdateMask := request.UpdateMask != nil && len(request.UpdateMask.Paths) > 0
+	if hasUpdateMask {
+		merged, err := s.mergeInstanceSettingWithMask(ctx, request.Setting, request.UpdateMask.Paths)
+		if err != nil {
+			return nil, err
+		}
+		updateSetting = merged
+	} else {
+		// Legacy behavior: full replace with credential preservation.
+		updateSetting = convertInstanceSettingToStore(request.Setting)
+		if err := s.preserveCredentialsForFullReplace(ctx, updateSetting); err != nil {
+			return nil, err
+		}
+	}
+
+	instanceSetting, err := s.Store.UpsertInstanceSetting(ctx, updateSetting)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to upsert instance setting: %v", err)
+	}
+
+	return convertInstanceSettingFromStore(instanceSetting), nil
+}
+
+// mergeInstanceSettingWithMask loads the existing setting, clones it, and applies
+// only the fields named in the update_mask paths from the incoming request.
+func (s *APIV1Service) mergeInstanceSettingWithMask(ctx context.Context, setting *v1pb.InstanceSetting, paths []string) (*storepb.InstanceSetting, error) {
+	settingKeyString, err := ExtractInstanceSettingKeyFromName(setting.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid instance setting name: %v", err)
+	}
+	instanceSettingKey := storepb.InstanceSettingKey(storepb.InstanceSettingKey_value[settingKeyString])
+
+	result := &storepb.InstanceSetting{Key: instanceSettingKey}
+
+	switch instanceSettingKey {
+	case storepb.InstanceSettingKey_GENERAL:
+		merged, err := s.mergeGeneralSetting(ctx, setting.GetGeneralSetting(), paths)
+		if err != nil {
+			return nil, err
+		}
+		result.Value = &storepb.InstanceSetting_GeneralSetting{GeneralSetting: merged}
+
+	case storepb.InstanceSettingKey_STORAGE:
+		merged, err := s.mergeStorageSetting(ctx, setting.GetStorageSetting(), paths)
+		if err != nil {
+			return nil, err
+		}
+		result.Value = &storepb.InstanceSetting_StorageSetting{StorageSetting: merged}
+
+	case storepb.InstanceSettingKey_MEMO_RELATED:
+		merged, err := s.mergeMemoRelatedSetting(ctx, setting.GetMemoRelatedSetting(), paths)
+		if err != nil {
+			return nil, err
+		}
+		result.Value = &storepb.InstanceSetting_MemoRelatedSetting{MemoRelatedSetting: merged}
+
+	case storepb.InstanceSettingKey_TAGS:
+		merged, err := s.mergeTagsSetting(ctx, setting.GetTagsSetting(), paths)
+		if err != nil {
+			return nil, err
+		}
+		result.Value = &storepb.InstanceSetting_TagsSetting{TagsSetting: merged}
+
+	case storepb.InstanceSettingKey_NOTIFICATION:
+		merged, err := s.mergeNotificationSetting(ctx, setting.GetNotificationSetting(), paths)
+		if err != nil {
+			return nil, err
+		}
+		result.Value = &storepb.InstanceSetting_NotificationSetting{NotificationSetting: merged}
+
+	case storepb.InstanceSettingKey_AI:
+		merged, err := s.mergeAISetting(ctx, setting.GetAiSetting(), paths)
+		if err != nil {
+			return nil, err
+		}
+		result.Value = &storepb.InstanceSetting_AiSetting{AiSetting: merged}
+
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "unsupported instance setting key: %v", instanceSettingKey)
+	}
+
+	return result, nil
+}
+
+// preserveCredentialsForFullReplace preserves write-only credential fields when
+// the caller sends an empty value during a full (no-mask) replace.
+func (s *APIV1Service) preserveCredentialsForFullReplace(ctx context.Context, updateSetting *storepb.InstanceSetting) error {
 	switch updateSetting.Key {
 	case storepb.InstanceSettingKey_NOTIFICATION:
 		if notif := updateSetting.GetNotificationSetting(); notif != nil && notif.Email != nil && notif.Email.SmtpPassword == "" {
 			existing, err := s.Store.GetInstanceNotificationSetting(ctx)
 			if err == nil && existing != nil && existing.Email != nil {
 				if existing.Email.SmtpPassword != "" && !sameSMTPConnectionIdentity(notif.Email, existing.Email) {
-					return nil, status.Errorf(codes.InvalidArgument, "smtp password is required when changing SMTP host, port, username, or encryption settings")
+					return status.Errorf(codes.InvalidArgument, "smtp password is required when changing SMTP host, port, username, or encryption settings")
 				}
 				notif.Email.SmtpPassword = existing.Email.SmtpPassword
 			}
@@ -209,18 +292,430 @@ func (s *APIV1Service) UpdateInstanceSetting(ctx context.Context, request *v1pb.
 		}
 	case storepb.InstanceSettingKey_AI:
 		if err := s.prepareInstanceAISettingForUpdate(ctx, updateSetting.GetAiSetting()); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "invalid AI setting: %v", err)
+			return status.Errorf(codes.InvalidArgument, "invalid AI setting: %v", err)
 		}
 	default:
 		// No credential preservation needed for other setting types.
 	}
+	return nil
+}
 
-	instanceSetting, err := s.Store.UpsertInstanceSetting(ctx, updateSetting)
+// mergeGeneralSetting merges the incoming general setting into the existing one,
+// applying only the fields named in paths.
+func (s *APIV1Service) mergeGeneralSetting(ctx context.Context, incoming *v1pb.InstanceSetting_GeneralSetting, paths []string) (*storepb.InstanceGeneralSetting, error) {
+	existing, err := s.Store.GetInstanceGeneralSetting(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to upsert instance setting: %v", err)
+		return nil, status.Errorf(codes.Internal, "failed to get existing general setting: %v", err)
+	}
+	merged := proto.Clone(existing).(*storepb.InstanceGeneralSetting)
+
+	if incoming == nil {
+		return merged, nil
 	}
 
-	return convertInstanceSettingFromStore(instanceSetting), nil
+	for _, path := range paths {
+		switch path {
+		case "general_setting":
+			merged = convertInstanceGeneralSettingToStore(incoming)
+		case "general_setting.disallow_user_registration":
+			merged.DisallowUserRegistration = incoming.DisallowUserRegistration
+		case "general_setting.disallow_password_auth":
+			merged.DisallowPasswordAuth = incoming.DisallowPasswordAuth
+		case "general_setting.additional_script":
+			merged.AdditionalScript = incoming.AdditionalScript
+		case "general_setting.additional_style":
+			merged.AdditionalStyle = incoming.AdditionalStyle
+		case "general_setting.custom_profile":
+			if incoming.CustomProfile != nil {
+				merged.CustomProfile = &storepb.InstanceCustomProfile{
+					Title:       incoming.CustomProfile.Title,
+					Description: incoming.CustomProfile.Description,
+					LogoUrl:     incoming.CustomProfile.LogoUrl,
+				}
+			} else {
+				merged.CustomProfile = nil
+			}
+		case "general_setting.week_start_day_offset":
+			merged.WeekStartDayOffset = incoming.WeekStartDayOffset
+		case "general_setting.disallow_change_username":
+			merged.DisallowChangeUsername = incoming.DisallowChangeUsername
+		case "general_setting.disallow_change_nickname":
+			merged.DisallowChangeNickname = incoming.DisallowChangeNickname
+		default:
+			return nil, status.Errorf(codes.InvalidArgument, "unsupported update mask path for general setting: %s", path)
+		}
+	}
+	return merged, nil
+}
+
+// mergeStorageSetting merges the incoming storage setting into the existing one,
+// applying only the fields named in paths. S3 access key secret is preserved
+// when the incoming value is empty.
+func (s *APIV1Service) mergeStorageSetting(ctx context.Context, incoming *v1pb.InstanceSetting_StorageSetting, paths []string) (*storepb.InstanceStorageSetting, error) {
+	existing, err := s.Store.GetInstanceStorageSetting(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get existing storage setting: %v", err)
+	}
+	merged := proto.Clone(existing).(*storepb.InstanceStorageSetting)
+
+	if incoming == nil {
+		return merged, nil
+	}
+
+	for _, path := range paths {
+		switch path {
+		case "storage_setting":
+			incomingStore := convertInstanceStorageSettingToStore(incoming)
+			merged = incomingStore
+			// Preserve S3 secret if empty.
+			if merged.S3Config != nil && merged.S3Config.AccessKeySecret == "" {
+				if existing.S3Config != nil {
+					merged.S3Config.AccessKeySecret = existing.S3Config.AccessKeySecret
+				}
+			}
+		case "storage_setting.storage_type":
+			merged.StorageType = storepb.InstanceStorageSetting_StorageType(incoming.StorageType)
+		case "storage_setting.filepath_template":
+			merged.FilepathTemplate = incoming.FilepathTemplate
+		case "storage_setting.upload_size_limit_mb":
+			merged.UploadSizeLimitMb = incoming.UploadSizeLimitMb
+		case "storage_setting.s3_config":
+			if incoming.S3Config != nil {
+				merged.S3Config = &storepb.StorageS3Config{
+					AccessKeyId:     incoming.S3Config.AccessKeyId,
+					AccessKeySecret: incoming.S3Config.AccessKeySecret,
+					Endpoint:        incoming.S3Config.Endpoint,
+					Region:          incoming.S3Config.Region,
+					Bucket:          incoming.S3Config.Bucket,
+					UsePathStyle:    incoming.S3Config.UsePathStyle,
+				}
+				// Preserve secret if empty.
+				if merged.S3Config.AccessKeySecret == "" && existing.S3Config != nil {
+					merged.S3Config.AccessKeySecret = existing.S3Config.AccessKeySecret
+				}
+			} else {
+				merged.S3Config = nil
+			}
+		case "storage_setting.s3_config.access_key_id":
+			if merged.S3Config == nil {
+				merged.S3Config = &storepb.StorageS3Config{}
+			}
+			merged.S3Config.AccessKeyId = incoming.GetS3Config().GetAccessKeyId()
+		case "storage_setting.s3_config.access_key_secret":
+			if merged.S3Config == nil {
+				merged.S3Config = &storepb.StorageS3Config{}
+			}
+			secret := incoming.GetS3Config().GetAccessKeySecret()
+			if secret == "" && existing.S3Config != nil {
+				secret = existing.S3Config.AccessKeySecret
+			}
+			merged.S3Config.AccessKeySecret = secret
+		case "storage_setting.s3_config.endpoint":
+			if merged.S3Config == nil {
+				merged.S3Config = &storepb.StorageS3Config{}
+			}
+			merged.S3Config.Endpoint = incoming.GetS3Config().GetEndpoint()
+		case "storage_setting.s3_config.region":
+			if merged.S3Config == nil {
+				merged.S3Config = &storepb.StorageS3Config{}
+			}
+			merged.S3Config.Region = incoming.GetS3Config().GetRegion()
+		case "storage_setting.s3_config.bucket":
+			if merged.S3Config == nil {
+				merged.S3Config = &storepb.StorageS3Config{}
+			}
+			merged.S3Config.Bucket = incoming.GetS3Config().GetBucket()
+		case "storage_setting.s3_config.use_path_style":
+			if merged.S3Config == nil {
+				merged.S3Config = &storepb.StorageS3Config{}
+			}
+			merged.S3Config.UsePathStyle = incoming.GetS3Config().GetUsePathStyle()
+		default:
+			return nil, status.Errorf(codes.InvalidArgument, "unsupported update mask path for storage setting: %s", path)
+		}
+	}
+	return merged, nil
+}
+
+// mergeMemoRelatedSetting merges the incoming memo-related setting into the
+// existing one, applying only the fields named in paths.
+func (s *APIV1Service) mergeMemoRelatedSetting(ctx context.Context, incoming *v1pb.InstanceSetting_MemoRelatedSetting, paths []string) (*storepb.InstanceMemoRelatedSetting, error) {
+	existing, err := s.Store.GetInstanceMemoRelatedSetting(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get existing memo related setting: %v", err)
+	}
+	merged := proto.Clone(existing).(*storepb.InstanceMemoRelatedSetting)
+
+	if incoming == nil {
+		return merged, nil
+	}
+
+	for _, path := range paths {
+		switch path {
+		case "memo_related_setting":
+			merged = convertInstanceMemoRelatedSettingToStore(incoming)
+		case "memo_related_setting.content_length_limit":
+			merged.ContentLengthLimit = incoming.ContentLengthLimit
+		case "memo_related_setting.enable_double_click_edit":
+			merged.EnableDoubleClickEdit = incoming.EnableDoubleClickEdit
+		case "memo_related_setting.reactions":
+			merged.Reactions = incoming.Reactions
+		default:
+			return nil, status.Errorf(codes.InvalidArgument, "unsupported update mask path for memo related setting: %s", path)
+		}
+	}
+	return merged, nil
+}
+
+// mergeTagsSetting merges the incoming tags setting into the existing one,
+// applying only the fields named in paths. Accepts both "tags_setting" and
+// "tags" for backward compatibility.
+func (s *APIV1Service) mergeTagsSetting(ctx context.Context, incoming *v1pb.InstanceSetting_TagsSetting, paths []string) (*storepb.InstanceTagsSetting, error) {
+	existing, err := s.Store.GetInstanceTagsSetting(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get existing tags setting: %v", err)
+	}
+	merged := proto.Clone(existing).(*storepb.InstanceTagsSetting)
+
+	if incoming == nil {
+		return merged, nil
+	}
+
+	for _, path := range paths {
+		switch path {
+		case "tags_setting", "tags":
+			// Full replace of tags map.
+			converted := convertInstanceTagsSettingToStore(incoming)
+			merged.Tags = converted.Tags
+		default:
+			return nil, status.Errorf(codes.InvalidArgument, "unsupported update mask path for tags setting: %s", path)
+		}
+	}
+	return merged, nil
+}
+
+// mergeNotificationSetting merges the incoming notification setting into the
+// existing one, applying only the fields named in paths. SMTP password is
+// preserved when the incoming value is empty, and required when the SMTP
+// connection identity changes.
+func (s *APIV1Service) mergeNotificationSetting(ctx context.Context, incoming *v1pb.InstanceSetting_NotificationSetting, paths []string) (*storepb.InstanceNotificationSetting, error) {
+	existing, err := s.Store.GetInstanceNotificationSetting(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get existing notification setting: %v", err)
+	}
+	merged := proto.Clone(existing).(*storepb.InstanceNotificationSetting)
+
+	if incoming == nil {
+		return merged, nil
+	}
+
+	for _, path := range paths {
+		switch path {
+		case "notification_setting":
+			incomingStore := convertInstanceNotificationSettingToStore(incoming)
+			merged = incomingStore
+			// Preserve SMTP password if empty.
+			if merged.Email != nil && merged.Email.SmtpPassword == "" {
+				if existing.Email != nil {
+					if existing.Email.SmtpPassword != "" && !sameSMTPConnectionIdentity(merged.Email, existing.Email) {
+						return nil, status.Errorf(codes.InvalidArgument, "smtp password is required when changing SMTP host, port, username, or encryption settings")
+					}
+					merged.Email.SmtpPassword = existing.Email.SmtpPassword
+				}
+			}
+		case "notification_setting.email":
+			if incoming.Email != nil {
+				newEmail := &storepb.InstanceNotificationSetting_EmailSetting{
+					Enabled:      incoming.Email.Enabled,
+					SmtpHost:     incoming.Email.SmtpHost,
+					SmtpPort:     incoming.Email.SmtpPort,
+					SmtpUsername: incoming.Email.SmtpUsername,
+					SmtpPassword: incoming.Email.SmtpPassword,
+					FromEmail:    incoming.Email.FromEmail,
+					FromName:     incoming.Email.FromName,
+					ReplyTo:      incoming.Email.ReplyTo,
+					UseTls:       incoming.Email.UseTls,
+					UseSsl:       incoming.Email.UseSsl,
+				}
+				// Preserve password if empty.
+				if newEmail.SmtpPassword == "" && existing.Email != nil {
+					if existing.Email.SmtpPassword != "" && !sameSMTPConnectionIdentity(newEmail, existing.Email) {
+						return nil, status.Errorf(codes.InvalidArgument, "smtp password is required when changing SMTP host, port, username, or encryption settings")
+					}
+					newEmail.SmtpPassword = existing.Email.SmtpPassword
+				}
+				merged.Email = newEmail
+			} else {
+				merged.Email = nil
+			}
+		case "notification_setting.email.enabled":
+			if merged.Email == nil {
+				merged.Email = &storepb.InstanceNotificationSetting_EmailSetting{}
+			}
+			merged.Email.Enabled = incoming.GetEmail().GetEnabled()
+		case "notification_setting.email.smtp_host":
+			if merged.Email == nil {
+				merged.Email = &storepb.InstanceNotificationSetting_EmailSetting{}
+			}
+			merged.Email.SmtpHost = incoming.GetEmail().GetSmtpHost()
+		case "notification_setting.email.smtp_port":
+			if merged.Email == nil {
+				merged.Email = &storepb.InstanceNotificationSetting_EmailSetting{}
+			}
+			merged.Email.SmtpPort = incoming.GetEmail().GetSmtpPort()
+		case "notification_setting.email.smtp_username":
+			if merged.Email == nil {
+				merged.Email = &storepb.InstanceNotificationSetting_EmailSetting{}
+			}
+			merged.Email.SmtpUsername = incoming.GetEmail().GetSmtpUsername()
+		case "notification_setting.email.smtp_password":
+			if merged.Email == nil {
+				merged.Email = &storepb.InstanceNotificationSetting_EmailSetting{}
+			}
+			password := incoming.GetEmail().GetSmtpPassword()
+			if password == "" && existing.Email != nil {
+				password = existing.Email.SmtpPassword
+			}
+			merged.Email.SmtpPassword = password
+		case "notification_setting.email.from_email":
+			if merged.Email == nil {
+				merged.Email = &storepb.InstanceNotificationSetting_EmailSetting{}
+			}
+			merged.Email.FromEmail = incoming.GetEmail().GetFromEmail()
+		case "notification_setting.email.from_name":
+			if merged.Email == nil {
+				merged.Email = &storepb.InstanceNotificationSetting_EmailSetting{}
+			}
+			merged.Email.FromName = incoming.GetEmail().GetFromName()
+		case "notification_setting.email.reply_to":
+			if merged.Email == nil {
+				merged.Email = &storepb.InstanceNotificationSetting_EmailSetting{}
+			}
+			merged.Email.ReplyTo = incoming.GetEmail().GetReplyTo()
+		case "notification_setting.email.use_tls":
+			if merged.Email == nil {
+				merged.Email = &storepb.InstanceNotificationSetting_EmailSetting{}
+			}
+			merged.Email.UseTls = incoming.GetEmail().GetUseTls()
+		case "notification_setting.email.use_ssl":
+			if merged.Email == nil {
+				merged.Email = &storepb.InstanceNotificationSetting_EmailSetting{}
+			}
+			merged.Email.UseSsl = incoming.GetEmail().GetUseSsl()
+		default:
+			return nil, status.Errorf(codes.InvalidArgument, "unsupported update mask path for notification setting: %s", path)
+		}
+	}
+	return merged, nil
+}
+
+// mergeAISetting merges the incoming AI setting into the existing one, applying
+// only the fields named in paths. Provider API keys are preserved when the
+// incoming value is empty, and transcription config is preserved when omitted.
+func (s *APIV1Service) mergeAISetting(ctx context.Context, incoming *v1pb.InstanceSetting_AISetting, paths []string) (*storepb.InstanceAISetting, error) {
+	existing, err := s.Store.GetInstanceAISetting(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get existing AI setting: %v", err)
+	}
+	merged := proto.Clone(existing).(*storepb.InstanceAISetting)
+
+	if incoming == nil {
+		return merged, nil
+	}
+
+	for _, path := range paths {
+		switch path {
+		case "ai_setting":
+			incomingStore := convertInstanceAISettingToStore(incoming)
+			merged = incomingStore
+			// Preserve API keys for providers with empty keys.
+			preserveAIAPIKeys(merged, existing)
+			// Preserve transcription if omitted.
+			if merged.Transcription == nil && existing.Transcription != nil {
+				merged.Transcription = existing.Transcription
+			}
+		case "ai_setting.providers":
+			merged.Providers = make([]*storepb.AIProviderConfig, 0, len(incoming.Providers))
+			for _, p := range incoming.Providers {
+				if p == nil {
+					continue
+				}
+				provider := &storepb.AIProviderConfig{
+					Id:       p.Id,
+					Title:    p.Title,
+					Type:     storepb.AIProviderType(p.Type),
+					Endpoint: p.Endpoint,
+					ApiKey:   p.ApiKey,
+				}
+				// Preserve API key if empty.
+				if provider.ApiKey == "" {
+					for _, ep := range existing.Providers {
+						if ep != nil && ep.Id == provider.Id {
+							provider.ApiKey = ep.ApiKey
+							break
+						}
+					}
+				}
+				merged.Providers = append(merged.Providers, provider)
+			}
+		case "ai_setting.transcription":
+			if incoming.Transcription != nil {
+				merged.Transcription = convertTranscriptionConfigToStore(incoming.Transcription)
+			} else {
+				merged.Transcription = nil
+			}
+		case "ai_setting.transcription.provider_id":
+			if merged.Transcription == nil {
+				merged.Transcription = &storepb.TranscriptionConfig{}
+			}
+			merged.Transcription.ProviderId = incoming.GetTranscription().GetProviderId()
+		case "ai_setting.transcription.model":
+			if merged.Transcription == nil {
+				merged.Transcription = &storepb.TranscriptionConfig{}
+			}
+			merged.Transcription.Model = incoming.GetTranscription().GetModel()
+		case "ai_setting.transcription.language":
+			if merged.Transcription == nil {
+				merged.Transcription = &storepb.TranscriptionConfig{}
+			}
+			merged.Transcription.Language = incoming.GetTranscription().GetLanguage()
+		case "ai_setting.transcription.prompt":
+			if merged.Transcription == nil {
+				merged.Transcription = &storepb.TranscriptionConfig{}
+			}
+			merged.Transcription.Prompt = incoming.GetTranscription().GetPrompt()
+		default:
+			return nil, status.Errorf(codes.InvalidArgument, "unsupported update mask path for AI setting: %s", path)
+		}
+	}
+
+	// Run AI-specific validation (ID generation, endpoint defaults, etc.).
+	if err := s.prepareInstanceAISettingForUpdate(ctx, merged); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid AI setting: %v", err)
+	}
+
+	return merged, nil
+}
+
+// preserveAIAPIKeys copies API keys from existing providers to merged providers
+// when the merged provider has an empty key.
+func preserveAIAPIKeys(merged, existing *storepb.InstanceAISetting) {
+	if existing == nil {
+		return
+	}
+	existingMap := make(map[string]string)
+	for _, p := range existing.Providers {
+		if p != nil && p.Id != "" {
+			existingMap[p.Id] = p.ApiKey
+		}
+	}
+	for _, p := range merged.Providers {
+		if p != nil && p.ApiKey == "" {
+			if key, ok := existingMap[p.Id]; ok {
+				p.ApiKey = key
+			}
+		}
+	}
 }
 
 func (s *APIV1Service) TestInstanceEmailSetting(ctx context.Context, request *v1pb.TestInstanceEmailSettingRequest) (*emptypb.Empty, error) {
