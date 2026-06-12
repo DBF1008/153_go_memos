@@ -134,6 +134,16 @@ func ExtractIdentityProviderUIDFromName(name string) (string, error) {
 	return tokens[0], nil
 }
 
+// ExtractUserWebhookID returns the user token and webhook ID from a resource name.
+// e.g., "users/alice/webhooks/abc" -> ("alice", "abc").
+func ExtractUserWebhookID(name string) (string, string, error) {
+	tokens, err := GetNameParentTokens(name, UserNamePrefix, WebhookNamePrefix)
+	if err != nil {
+		return "", "", err
+	}
+	return tokens[0], tokens[1], nil
+}
+
 // ValidateAndGenerateUID validates a user-provided UID or generates a new one.
 // If provided is empty, a new shortuuid is generated.
 // If provided is non-empty, it is validated against base.UIDMatcher.

@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/usememos/memos/internal/util"
@@ -485,16 +486,16 @@ func (s *APIV1Service) resolveUserAndSettingKeyFromName(ctx context.Context, nam
 }
 
 func (s *APIV1Service) resolveUserAndWebhookIDFromName(ctx context.Context, name string) (*store.User, string, error) {
-	parts := strings.Split(name, "/")
-	if len(parts) != 4 || parts[0] != "users" || parts[2] != "webhooks" {
-		return nil, "", errors.New("invalid webhook name format")
-	}
-
-	user, err := s.resolveUserFromName(ctx, BuildUserName(parts[1]))
+	userToken, webhookID, err := ExtractUserWebhookID(name)
 	if err != nil {
 		return nil, "", err
 	}
-	return user, parts[3], nil
+
+	user, err := s.resolveUserFromName(ctx, BuildUserName(userToken))
+	if err != nil {
+		return nil, "", err
+	}
+	return user, webhookID, nil
 }
 
 func (s *APIV1Service) resolveUserAndLinkedIdentityProviderFromName(ctx context.Context, name string) (*store.User, string, error) {
@@ -1469,12 +1470,7 @@ func convertUserSettingFromStore(storeSetting *storepb.UserSetting, user *store.
 		if webhooks != nil {
 			apiWebhooks = make([]*v1pb.UserWebhook, 0, len(webhooks.Webhooks))
 			for _, webhook := range webhooks.Webhooks {
-				apiWebhook := &v1pb.UserWebhook{
-					Name:        fmt.Sprintf("%s/webhooks/%s", BuildUserName(user.Username), webhook.Id),
-					Url:         webhook.Url,
-					DisplayName: webhook.Title,
-				}
-				apiWebhooks = append(apiWebhooks, apiWebhook)
+				apiWebhooks = append(apiWebhooks, convertUserWebhookFromUserSetting(webhook, user))
 			}
 		}
 		setting.Value = &v1pb.UserSetting_WebhooksSetting_{
@@ -1514,24 +1510,12 @@ func convertUserSettingToStore(apiSetting *v1pb.UserSetting, userID int32, key s
 			return nil, errors.Errorf("general setting is required")
 		}
 	case storepb.UserSetting_WEBHOOKS:
-		if webhooks := apiSetting.GetWebhooksSetting(); webhooks != nil {
-			storeWebhooks := make([]*storepb.WebhooksUserSetting_Webhook, 0, len(webhooks.Webhooks))
-			for _, webhook := range webhooks.Webhooks {
-				storeWebhook := &storepb.WebhooksUserSetting_Webhook{
-					Id:    extractWebhookIDFromName(webhook.Name),
-					Title: webhook.DisplayName,
-					Url:   webhook.Url,
-				}
-				storeWebhooks = append(storeWebhooks, storeWebhook)
-			}
-			storeSetting.Value = &storepb.UserSetting_Webhooks{
-				Webhooks: &storepb.WebhooksUserSetting{
-					Webhooks: storeWebhooks,
-				},
-			}
-		} else {
-			return nil, errors.Errorf("webhooks setting is required")
-		}
+		// Webhooks are managed exclusively through the dedicated UserWebhook API
+		// (Create/Update/DeleteUserWebhook). They must never be written via the
+		// generic user-settings path: the API representation has the signing
+		// secret stripped (INPUT_ONLY), so round-tripping it back into the store
+		// here would silently wipe every webhook's signing secret.
+		return nil, errors.Errorf("webhooks cannot be updated via user settings; use the UserWebhook API")
 	case storepb.UserSetting_TAGS:
 		if tags := apiSetting.GetTagsSetting(); tags != nil {
 			storeSetting.Value = &storepb.UserSetting_Tags{
@@ -1545,16 +1529,6 @@ func convertUserSettingToStore(apiSetting *v1pb.UserSetting, userID int32, key s
 	}
 
 	return storeSetting, nil
-}
-
-// extractWebhookIDFromName extracts webhook ID from resource name.
-// e.g., "users/123/webhooks/webhook-id" -> "webhook-id".
-func extractWebhookIDFromName(name string) string {
-	parts := strings.Split(name, "/")
-	if len(parts) >= 4 && parts[0] == "users" && parts[2] == "webhooks" {
-		return parts[3]
-	}
-	return ""
 }
 
 // extractUsernameFromFilter extracts username from the filter string using CEL.
